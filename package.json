@@ -1,0 +1,19 @@
+{
+  "name": "medici",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "frontend"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace frontend",
+    "build": "npm run build --workspace frontend",
+    "check": "npm run check --workspace frontend",
+    "format": "prettier --write frontend/src frontend/*.ts frontend/*.json *.json *.md .github/workflows/*.yml",
+    "test": ".venv/bin/python -m pytest backend/tests -q",
+    "start": ".venv/bin/python -m uvicorn backend.app:app --host 127.0.0.1 --port 8000"
+  },
+  "devDependencies": {
+    "prettier": "^3.9.10"
+  }
+}
