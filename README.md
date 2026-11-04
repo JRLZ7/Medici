@@ -2,7 +2,7 @@
 
 A local evidence workspace for scientific experiments. Record the experiment, recover the details, and review the evidence.
 
-Medici brings an original recording, a versioned written procedure, and human-reviewed timestamped observations into one workspace. **AI analysis is disabled.** It never calls a model or uploads footage to an external service.
+Medici brings an original recording, a versioned written procedure, and human-reviewed timestamped observations into one workspace. **Automatic analysis is disabled by default.** An explicitly enabled experimental command can analyze sampled frames with a local Ollama vision model. No cloud inference or external footage upload is implemented.
 
 ## Requirements
 
@@ -43,9 +43,11 @@ Open http://127.0.0.1:5173. Vite forwards `/api` to the loopback backend. `npm r
 5. Click an observation's timestamp to seek to its evidence. Review/edit it and choose unreviewed, confirmed, corrected, or dismissed.
 6. Reopen the experiment after reload/restart. Export the JSON record and download the original video separately.
 
-Uploads always begin with an empty observation timeline. There is no simulated analysis, seeded finding, or inference provider. Invisible actions should be marked not verifiable; an unwritten detail is not automatically a mistake.
+Uploads always begin with an empty observation timeline. There is no simulated analysis or seeded finding. Optional local model runs must be explicitly enabled and imported as unreviewed suggestions. Invisible actions should be marked not verifiable; an unwritten detail is not automatically a mistake.
 
 Explicitly prepared assistant reviews use `source: assistant_review`, require a provenance note, and start unreviewed. Human edits preserve the original proposal and provenance. This supports importing a separately prepared review; it does not enable automated video analysis.
+
+The **Per-step review** panel groups active findings for the current structured procedure. Expand a step to seek its evidence or review a finding. Save a separate step conclusion (supported, potential deviation, or not verifiable) with a rationale. Findings never automatically establish step completion. Supported conclusions require confirmed or corrected action evidence; the reviewer must still check all requirements, quantities, and expectations. Dismissed findings are excluded, and earlier procedure versions are kept separate. Evidence edits flag previous conclusions for review again. Step conclusions and their revision history persist locally and are included in JSON exports.
 
 ## Architecture
 
@@ -59,11 +61,12 @@ SQLite records              Private original videos
 
 - `frontend/src/`: experiment library, player, procedure, review editor, camera capture.
 - `backend/app.py`: validation, records, media streaming, exports, and security boundaries.
+- `backend/analysis.py`: frame-bundle preparation, model response contract, and evidence validation. `backend/ollama_adapter.py` connects an explicitly enabled local vision model. See [Local model integration](docs/MODEL_INTEGRATION.md) for preparation, inference, validation, and import commands.
 - `backend/tests/`: real media and API integration tests.
-- SQLite uses schema version 3 (additive source-attribution and parsed-procedure tables preserve existing local records). IDs are UUIDs. Procedure edits create versions with independent step IDs; old observations retain their original version and step links. Observation edits preserve prior snapshots in review history.
+- SQLite uses schema version 5 (additive source-attribution, parsed-procedure, step-review, and imported analysis-run tables preserve existing local records). IDs are UUIDs. Procedure edits create versions with independent step IDs; old observations and step conclusions retain their original version and step links. Observation and step-conclusion edits preserve prior snapshots in review history. Imported model runs preserve original responses and model provenance.
 - Media inspection uses bundled FFmpeg with external protocols disabled and a 60-second timeout per pass. It checks container structure and a video stream, using container metadata for duration. Camera WebM without duration metadata is decoded to a null sink in a second pass to measure the full duration; original files are never transcoded or modified. Long camera recordings may exceed this processing timeout. Browser decoding compatibility is a separate check; a valid container may still contain a codec your browser cannot play.
 - One original recording per experiment. To review another recording, create another experiment.
-- Parsed procedures define a versioned tracking plan: only referenced materials, numbered actions, and explicit expectations are targets. Materials, details, and notes render separately. Old/source documents remain unparsed until explicitly converted; they never acquire invented tracking scope. Models and active video tracking remain disabled.
+- Parsed procedures define a versioned tracking plan: only referenced materials, numbered actions, and explicit expectations are targets. Materials, details, and notes render separately. Old/source documents remain unparsed until explicitly converted; they never acquire invented tracking scope. Automatic analysis and continuous tracking remain disabled; optional offline local runs use sampled images.
 
 ## Storage, privacy, and security
 
@@ -119,7 +122,7 @@ For the verified public-data example, provenance, and FineBio access requirement
 - Validated JSON + media import/export round trip.
 - Recoverable drafts and interrupted-recording recovery beyond best-effort browser memory.
 - An explicitly separate sample session and richer review-history UI (history is already retained in exports).
-- Local vision-model feasibility tests, only when enabled. No model runner or provider is configured; Ollama/Qwen remain candidates, not integrated features.
+- Evaluate and improve the experimental local Qwen/Ollama adapter on held-out, human-reviewed recordings. Automatic inference remains disabled; sparse-frame candidates require review.
 
 Medici helps document and investigate experiments. It does not establish causality, prove reproducibility, detect malpractice, or provide certified safety guidance.
 

@@ -21,6 +21,7 @@ import {
   X,
 } from 'lucide-react';
 import './style.css';
+import { StepSummary, type StepSummaryRow } from './StepSummary';
 import {
   ProtocolDocument,
   ProtocolPreview,
@@ -73,6 +74,14 @@ type Experiment = {
     sizeBytes: number;
   };
   observations: Observation[];
+  stepSummary?: StepSummaryRow[];
+  analysisRuns?: {
+    id: string;
+    model: string;
+    modelDigest: string;
+    candidateCount: number;
+    importedAt: string;
+  }[];
 };
 type Summary = { id: string; title: string; updatedAt: string };
 type Draft = {
@@ -234,7 +243,7 @@ function App() {
     ]);
     setSaveState('All changes saved locally');
   };
-  async function run(action: () => Promise<void>) {
+  async function run(action: () => Promise<void>, propagateError = false) {
     setBusy(true);
     setError('');
     setSaveState('Saving…');
@@ -245,6 +254,7 @@ function App() {
         e instanceof Error ? e.message : 'Something went wrong. Please retry.',
       );
       setSaveState('Not saved — retry');
+      if (propagateError) throw e;
     } finally {
       setBusy(false);
     }
@@ -395,10 +405,22 @@ function App() {
     e.preventDefault();
     if (!editor || !active) return;
     await run(async () => {
-      if (editingObservation?.source === 'assistant_review') {
-        const health = await api<{ assistantReviewProvenance?: boolean }>('/health');
-        if (!health.assistantReviewProvenance) {
-          throw new Error('Restart Medici in your terminal (Ctrl+C, then npm start) before reviewing assistant suggestions. Your edits are still here.');
+      if (
+        editingObservation &&
+        ['assistant_review', 'local_model'].includes(editingObservation.source)
+      ) {
+        const health = await api<{
+          assistantReviewProvenance?: boolean;
+          localModelImport?: boolean;
+        }>('/health');
+        if (
+          !health.assistantReviewProvenance ||
+          (editingObservation.source === 'local_model' &&
+            !health.localModelImport)
+        ) {
+          throw new Error(
+            'Restart Medici in your terminal (Ctrl+C, then npm start) before reviewing assistant suggestions. Your edits are still here.',
+          );
         }
       }
       const {
@@ -427,7 +449,10 @@ function App() {
               reviewerNote,
               expectedUpdatedAt: editingObservation?.updatedAt || '',
               ...(editingObservation?.source === 'assistant_review'
-                ? { source: editingObservation.source, provenanceNote: editingObservation.provenanceNote || '' }
+                ? {
+                    source: editingObservation.source,
+                    provenanceNote: editingObservation.provenanceNote || '',
+                  }
                 : {}),
             }),
           },
@@ -706,9 +731,9 @@ function App() {
             <div className="honesty-note">
               <ShieldCheck size={17} />
               <p>
-                <strong>Evidence first. Always.</strong> Analysis is disabled.
-                Observations are added and reviewed by you; no footage is sent
-                to a model.
+                <strong>Evidence first. Always.</strong> Automatic analysis is
+                disabled. Review manual findings and explicitly imported local
+                model suggestions here.
               </p>
             </div>
           </div>
@@ -749,7 +774,14 @@ function App() {
                 aria-label="Public dataset provenance"
               >
                 <strong>Public dataset · {active.datasetSource.name}</strong>
-                <p>{active.datasetSource.referenceNote}</p>
+                <p>
+                  {active.analysisRuns?.length
+                    ? active.datasetSource.referenceNote.replace(
+                        'No model analysis has run.',
+                        'Imported local model runs are recorded separately below.',
+                      )
+                    : active.datasetSource.referenceNote}
+                </p>
                 <p>
                   Source video: {active.datasetSource.videoFilename} · Protocol:{' '}
                   {active.datasetSource.protocolFilename}
@@ -762,6 +794,27 @@ function App() {
                   Original dataset ↗
                 </a>
                 <span> · {active.datasetSource.license}</span>
+              </aside>
+            )}
+            {!!active.analysisRuns?.length && (
+              <aside
+                className="dataset-notice"
+                aria-label="Imported local model runs"
+              >
+                <strong>
+                  Experimental local model suggestions · human review required
+                </strong>
+                {active.analysisRuns.map((r) => (
+                  <p key={r.id}>
+                    {r.model} · {r.candidateCount} suggestions · run{' '}
+                    {r.id.slice(0, 8)} · model digest{' '}
+                    {r.modelDigest.slice(0, 16)}
+                  </p>
+                ))}
+                <p>
+                  Sparse sampled frames, no audio or continuous tracking. These
+                  runs do not establish step completion.
+                </p>
               </aside>
             )}
             <div className="review-columns">
@@ -922,6 +975,43 @@ function App() {
                     </div>
                   )}
                 </section>
+                <StepSummary
+                  rows={active.stepSummary}
+                  observations={active.observations}
+                  versionId={active.procedureVersionId}
+                  structured={
+                    currentProcedure?.structure?.status === 'structured'
+                  }
+                  disabled={locked}
+                  historicalCount={
+                    active.observations.filter(
+                      (o) => o.procedureVersionId !== active.procedureVersionId,
+                    ).length
+                  }
+                  onSeek={(id) => {
+                    const o = active.observations.find((o) => o.id === id);
+                    if (o) seek(o);
+                  }}
+                  onReview={(id) => {
+                    const o = active.observations.find((o) => o.id === id);
+                    if (o) {
+                      seek(o);
+                      beginObservation(o);
+                    }
+                  }}
+                  onSave={async (id, body) => {
+                    await run(
+                      async () =>
+                        update(
+                          await api<Experiment>(
+                            `/experiments/${active.id}/step-reviews/${id}`,
+                            { method: 'PUT', body: JSON.stringify(body) },
+                          ),
+                        ),
+                      true,
+                    );
+                  }}
+                />
                 <section className="panel procedure-panel">
                   <div className="panel-heading">
                     <h2>
@@ -1068,13 +1158,17 @@ function App() {
                           </p>
                         )}
                         {o.provenanceNote && (
-                          <p className="evidence-note">Source: {o.provenanceNote}</p>
+                          <p className="evidence-note">
+                            Source: {o.provenanceNote}
+                          </p>
                         )}
                         <div className="observation-footer">
                           <span>
-                            {o.source === 'assistant_review'
-                              ? 'Assistant-prepared suggestion'
-                              : 'Added manually'}
+                            {o.source === 'local_model'
+                              ? 'Local model suggestion'
+                              : o.source === 'assistant_review'
+                                ? 'Assistant-prepared suggestion'
+                                : 'Added manually'}
                             {o.history.length > 0
                               ? ` · ${o.history.length} revision${o.history.length === 1 ? '' : 's'}`
                               : ''}
@@ -1124,8 +1218,8 @@ function App() {
                   <div>
                     <strong>You are the reviewer</strong>
                     <p>
-                      AI analysis is unavailable. No automatic findings or model
-                      calls.
+                      Automatic analysis is disabled. Imported local model
+                      suggestions require your review.
                     </p>
                   </div>
                 </div>

@@ -20,6 +20,8 @@ from pydantic import BaseModel, Field, ConfigDict
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from typing import Literal
 from backend.protocol import parse_protocol, tracking_plan
+from backend.analysis import validate_response, digest
+from backend.ollama_adapter import MODEL as LOCAL_VISION_MODEL
 
 ROOT = Path(__file__).resolve().parents[1]
 CATEGORIES = {"observation", "potential_deviation", "unwritten_detail", "not_verifiable"}
@@ -55,6 +57,20 @@ class ExperimentInput(BaseModel):
 
 class ParseInput(BaseModel):
     text: str = Field(max_length=100000)
+
+
+class StepReviewInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    procedureVersionId: str
+    conclusion: Literal["supported", "potential_deviation", "not_verifiable"]
+    note: str = Field(min_length=1, max_length=10000)
+    expectedEvidenceFingerprint: str
+    expectedUpdatedAt: str = ""
+
+
+class AnalysisImportInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    runId: uuid.UUID
 
 
 class ObservationInput(BaseModel):
@@ -144,7 +160,12 @@ def create_app(data_dir=None, max_upload=None):
                     experiment_id TEXT PRIMARY KEY REFERENCES experiments(id), payload TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS procedure_structures (
                     procedure_id TEXT PRIMARY KEY REFERENCES procedures(id), payload TEXT NOT NULL);
-                PRAGMA user_version = 3;
+                CREATE TABLE IF NOT EXISTS step_reviews (
+                    procedure_id TEXT NOT NULL REFERENCES procedures(id), step_id TEXT NOT NULL,
+                    payload TEXT NOT NULL, PRIMARY KEY (procedure_id, step_id));
+                CREATE TABLE IF NOT EXISTS analysis_runs (
+                    id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL REFERENCES experiments(id), payload TEXT NOT NULL);
+                PRAGMA user_version = 5;
             """)
         (data / "medici.sqlite3").chmod(0o600)
         yield
@@ -214,6 +235,9 @@ def create_app(data_dir=None, max_upload=None):
         current = next(v for v in versions if v["id"] == e["version_id"])
         video = c.execute("SELECT * FROM videos WHERE experiment_id=?", (experiment_id,)).fetchone()
         source = c.execute("SELECT payload FROM dataset_sources WHERE experiment_id=?", (experiment_id,)).fetchone()
+        observations = [json.loads(o[0]) for o in c.execute("SELECT payload FROM observations WHERE experiment_id=?", (experiment_id,))]
+        reviews = [json.loads(r[0]) for r in c.execute(
+            "SELECT payload FROM step_reviews WHERE procedure_id IN (SELECT id FROM procedures WHERE experiment_id=?)", (experiment_id,))]
         return {"id": e["id"], "title": e["title"], "createdAt": e["created_at"], "updatedAt": e["updated_at"],
                 "datasetSource": json.loads(source[0]) if source else None,
                 "trackingPlan": tracking_plan(current["id"], current["structure"], current["steps"]),
@@ -221,7 +245,58 @@ def create_app(data_dir=None, max_upload=None):
                 "video": None if video is None else {"id": video["id"], "originalFilename": video["filename"],
                     "durationSeconds": video["duration"], "mimeType": video["mime"], "sizeBytes": video["size"],
                     "checksum": video["checksum"]},
-                "observations": [json.loads(o[0]) for o in c.execute("SELECT payload FROM observations WHERE experiment_id=?", (experiment_id,))]}
+                "observations": observations, "stepReviews": reviews,
+                "analysisRuns": [json.loads(r[0]) for r in c.execute("SELECT payload FROM analysis_runs WHERE experiment_id=? ORDER BY rowid", (experiment_id,))],
+                "stepSummary": summarize_steps(current, observations, reviews)}
+
+    def summarize_steps(procedure, observations, reviews):
+        if not procedure.get("structure") or procedure["structure"]["status"] != "structured":
+            return []
+        result = []
+        for step in procedure["steps"]:
+            linked = sorted([o for o in observations if o["procedureVersionId"] == procedure["id"]
+                             and step["id"] in o["procedureStepIds"]], key=lambda o: o["id"])
+            fingerprint = hashlib.sha256(json.dumps(linked, sort_keys=True).encode()).hexdigest()
+            evidence = [o for o in linked if o["reviewStatus"] != "dismissed"]
+            review = next((r for r in reviews if r["procedureVersionId"] == procedure["id"] and r["stepId"] == step["id"]), None)
+            result.append({"stepId": step["id"], "order": step["order"], "text": step["text"],
+                           "evidenceIds": [o["id"] for o in evidence], "dismissedCount": len(linked) - len(evidence),
+                           "unreviewedCount": sum(o["reviewStatus"] == "unreviewed" for o in evidence),
+                           "potentialDeviationCount": sum(o["category"] == "potential_deviation" for o in evidence),
+                           "notVerifiableCount": sum(o["category"] == "not_verifiable" for o in evidence),
+                           "evidenceFingerprint": fingerprint, "review": review,
+                           "conclusion": review["conclusion"] if review else "unassessed",
+                           "reviewStatus": "awaiting_review" if not review else (
+                               "reviewed" if review["evidenceFingerprint"] == fingerprint else "needs_review")})
+        return result
+
+    @app.put("/api/experiments/{eid}/step-reviews/{step_id}")
+    def save_step_review(eid: str, step_id: str, body: StepReviewInput):
+        with db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            e = full(c, eid)
+            if body.procedureVersionId != e["procedureVersionId"]:
+                raise HTTPException(409, "Procedure changed. Reopen the experiment before reviewing steps.")
+            summary = next((s for s in e["stepSummary"] if s["stepId"] == step_id), None)
+            if not summary:
+                raise HTTPException(422, "Choose a step from the current structured procedure.")
+            previous = summary["review"]
+            if body.expectedEvidenceFingerprint != summary["evidenceFingerprint"] or body.expectedUpdatedAt != (previous["updatedAt"] if previous else ""):
+                raise HTTPException(409, "Step evidence or assessment changed. Reopen the experiment before saving.")
+            evidence = [o for o in e["observations"] if o["id"] in summary["evidenceIds"]]
+            if not body.note.strip():
+                raise HTTPException(422, "Explain the conclusion and any limits of the evidence.")
+            if body.conclusion == "supported" and not any(o["reviewStatus"] in {"confirmed", "corrected"}
+                    and o["category"] in {"observation", "unwritten_detail"} for o in evidence):
+                raise HTTPException(422, "Review and confirm supporting evidence before marking a step supported.")
+            stamp = now()
+            review = {"procedureVersionId": body.procedureVersionId, "stepId": step_id,
+                      "conclusion": body.conclusion, "note": body.note.strip(), "source": "manual",
+                      "evidenceFingerprint": summary["evidenceFingerprint"], "updatedAt": stamp,
+                      "history": previous["history"] + [{k: v for k, v in previous.items() if k != "history"}] if previous else []}
+            c.execute("INSERT OR REPLACE INTO step_reviews VALUES (?,?,?)", (body.procedureVersionId, step_id, json.dumps(review)))
+            c.execute("UPDATE experiments SET updated_at=? WHERE id=?", (stamp, eid))
+            return full(c, eid)
 
     def make_procedure(c, eid, text, source_document=False, draft=False):
         pid = uid()
@@ -246,7 +321,7 @@ def create_app(data_dir=None, max_upload=None):
     @app.get("/api/health")
     def health():
         return {"status": "ok", "analysis": "disabled", "maxUploadBytes": limit,
-                "assistantReviewProvenance": True}
+                "assistantReviewProvenance": True, "localModelImport": True}
 
     @app.get("/api/experiments")
     def list_experiments():
@@ -400,6 +475,68 @@ def create_app(data_dir=None, max_upload=None):
     @app.put("/api/experiments/{eid}/observations/{oid}")
     def edit_observation(eid: str, oid: str, body: ObservationInput):
         return save_observation(eid, body, oid)
+
+    @app.post("/api/experiments/{eid}/analysis-runs/import")
+    def import_analysis_run(eid: str, body: AnalysisImportInput):
+        run_id = str(body.runId)
+        folder = (data / "analysis" / "runs" / run_id).resolve()
+        if not folder.is_relative_to(data):
+            raise HTTPException(422, "Analysis run must be in this workspace's private storage.")
+        try:
+            if not (folder / "input").resolve().is_relative_to(folder):
+                raise ValueError("Run evidence escapes its private run directory.")
+            for name in ("run.json", "response.json"):
+                if not (folder / name).resolve().is_relative_to(folder) or (folder / name).stat().st_size > 2 * 1024 * 1024:
+                    raise ValueError("Invalid run file.")
+            metadata = json.loads((folder / "run.json").read_text())
+            if not isinstance(metadata, dict):
+                raise ValueError("Invalid run metadata.")
+            response = validate_response(folder / "input", json.loads((folder / "response.json").read_text()))
+            response_sha = digest(folder / "response.json")
+            if (metadata.get("status") != "completed" or metadata.get("id") != run_id
+                    or response.responseKind != "inference" or response.provider != "ollama-local"
+                    or response.model != LOCAL_VISION_MODEL or metadata.get("model") != response.model
+                    or metadata.get("provider") != response.provider or not metadata.get("modelDigest")
+                    or metadata.get("inputManifestSha256") != response.inputManifestSha256
+                    or metadata.get("experimentId") != response.experimentId
+                    or metadata.get("procedureVersionId") != response.procedureVersionId
+                    or metadata.get("videoSha256") != response.videoSha256
+                    or metadata.get("completedBatches") != metadata.get("plannedBatches")
+                    or metadata.get("candidateCount") != len(response.findings)):
+                raise ValueError("Run is incomplete, synthetic, or inconsistent.")
+        except (OSError, ValueError, KeyError, TypeError):
+            raise HTTPException(422, "Run cannot be imported. Use a completed, validated local inference run with intact evidence; fixtures are not importable.")
+        with db() as c:
+            c.execute("BEGIN IMMEDIATE")
+            e = full(c, eid)
+            if (response.experimentId != eid or response.procedureVersionId != e["procedureVersionId"]
+                    or not e["video"] or response.videoSha256 != e["video"]["checksum"]):
+                raise HTTPException(409, "Experiment procedure or video does not match the analysis run. Prepare a new run.")
+            previous = c.execute("SELECT experiment_id, payload FROM analysis_runs WHERE id=?", (run_id,)).fetchone()
+            if previous:
+                if previous[0] != eid or json.loads(previous[1])["responseSha256"] != response_sha:
+                    raise HTTPException(409, "Imported run changed. Existing suggestions were preserved.")
+                return e  # Idempotent: never replace subsequent human edits.
+            stamp, ids = now(), []
+            provenance = (f"Local Ollama model {response.model}; digest {metadata['modelDigest']}; run {run_id}. "
+                          "Sparse sampled frames, no audio or continuous tracking. Model suggestions require human review.")
+            for finding in response.findings:
+                oid = uid()
+                ids.append(oid)
+                observation = {"id": oid, "experimentId": eid, "procedureVersionId": response.procedureVersionId,
+                    "startSeconds": finding.startSeconds, "endSeconds": finding.endSeconds,
+                    "description": finding.description, "category": finding.category,
+                    "procedureStepIds": finding.procedureStepIds, "evidenceNote": finding.evidenceNote +
+                        "\nLimitations: " + finding.limitations + "\nEvidence frames: " + ", ".join(finding.evidenceFrameIds),
+                    "reviewStatus": "unreviewed", "reviewerNote": "", "source": "local_model",
+                    "provenanceNote": provenance, "analysisRunId": run_id, "originalProposal": finding.model_dump(),
+                    "createdAt": stamp, "updatedAt": stamp, "history": []}
+                c.execute("INSERT INTO observations VALUES (?,?,?)", (oid, eid, json.dumps(observation)))
+            saved_run = {**metadata, "imported": True, "importedAt": stamp, "observationIds": ids,
+                         "responseSha256": response_sha, "originalResponse": response.model_dump()}
+            c.execute("INSERT INTO analysis_runs VALUES (?,?,?)", (run_id, eid, json.dumps(saved_run)))
+            c.execute("UPDATE experiments SET updated_at=? WHERE id=?", (stamp, eid))
+            return full(c, eid)
 
     @app.get("/api/experiments/{eid}/export")
     def export(eid: str):
