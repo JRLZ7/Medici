@@ -1,0 +1,5 @@
+# Optional isolated native-video experiment. Never install into the app venv.
+mlx-vlm==0.7.11
+opencv-python-headless==4.14.0.94
+av==17.1.0
+imageio-ffmpeg==0.8.1

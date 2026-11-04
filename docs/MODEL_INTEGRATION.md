@@ -115,3 +115,32 @@ The first real focused run (`531dd0e0-3869-4a16-b2b3-55850ba88904`) produced thr
 Inspect every initial candidate for usefulness and unsupported claims, then compare on a second human-reviewed recording before expanding scope or tuning models. Keep known Zenodo benchmark labels separate from prompts and do not report this debug case as blind evaluation.
 
 Backup/restore remains useful follow-up work; it is not required to connect a first experimental local adapter. No model training is required for that initial connection.
+
+## Native video: coarse timestamps, then overlapping clips
+
+An optional CLI experiment now uses Qwen3-VL through MLX-VLM on this Apple Silicon Mac. It supplies native video tensors and checks for temporal video tokens; it refuses an image-only fallback. Native video still samples frames: this experiment uses 1 fps for the overview and 2 fps for detailed clips. Audio is excluded. It is separate from the Ollama adapter and has no app import or automatic review action.
+
+The overview sees the full recording without the procedure, prior findings, or benchmark answers. Approximate event proposals receive one second of context and split into clips of at most eight seconds with two seconds of overlap. Independent coverage windows fill any gaps, including when the first pass returns no events. Detailed descriptions also receive no procedure or earlier descriptions. A final text-only pass proposes numbered step associations; these do not establish completion. Overlap can produce duplicate candidates.
+
+Use a separate Python 3.12 environment, never the app environment:
+
+```sh
+.venv/bin/python -m venv .venv-video
+.venv-video/bin/python -m pip install -r backend/video-requirements.txt
+```
+
+The explicitly downloaded model is `mlx-community/Qwen3-VL-4B-Instruct-4bit`, revision `2fd8dacbdb8f1e54b8c005f081ec5bf79c56376b`, under private `data/mlx/models/qwen3-vl-4b-instruct-4bit/`. Inference loads local files only, disables Hugging Face network access/telemetry, and disallows remote model code. The model download is a separate, explicit operation. Runtime version is pinned in the optional lock file.
+
+```sh
+.venv-video/bin/python -m backend.mlx_video_pipeline \
+  --export data/readiness-source-20261104/record-export.json \
+  --video data/datasets/zenodo-17710382/Dilute_docuWrongSolvent.MP4 \
+  --model-dir data/mlx/models/qwen3-vl-4b-instruct-4bit \
+  --enable-local-inference
+```
+
+Runs accept checksum-matched recordings up to 90 seconds, at most 24 clips, a 180-second request timeout, and a 20-minute attempt budget. Private UUID folders under `data/video-experiments/` contain derived clips, original-video offsets, checksums, native-input audit details, exact prompts/settings, raw and validated responses, status, and `REVIEW.md`. Original recordings and real experiment records are never modified. Generated labels/actions remain unverified even when JSON validates. A readable brand label does not prove the identity of laboratory contents, and model timestamps are approximate.
+
+To resume a failed/cancelled run, add `--resume-run data/video-experiments/RUN-UUID` to the same command. Video, procedure version, model, overview, clip plan, and cached clip checksums must match. Completed clips are reused; failed clips get new attempt filenames, retaining earlier raw output. Truncated/invalid output stops the run and is never accepted. Resume requires a saved event pass and clip plan; failures before those exist require a new run. No background service or automatic retry is installed.
+
+The first debug run is `cfda905b-0a39-46f2-bf18-11a552684137`. An output repetition failure required a resumed attempt with concise prompts and sampling/repetition controls. Thus its early and later clip settings differ: this is an integration experiment, not a controlled comparison or accuracy benchmark. Review its private assessment before considering any app integration.

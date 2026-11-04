@@ -124,6 +124,8 @@ For the verified public-data example, provenance, and FineBio access requirement
 - An explicitly separate sample session and richer review-history UI (history is already retained in exports).
 - Evaluate and improve the experimental local Qwen/Ollama adapter on held-out, human-reviewed recordings. Automatic inference remains disabled; sparse-frame candidates require review.
 
+An optional [native-video experiment](docs/MODEL_INTEGRATION.md#native-video-coarse-timestamps-then-overlapping-clips) tries a full-recording overview followed by overlapping clips and separate procedure matching. It uses an isolated MLX environment, saves private review artifacts, and does not change experiments in the app.
+
 Medici helps document and investigate experiments. It does not establish causality, prove reproducibility, detect malpractice, or provide certified safety guidance.
 
 ## License
